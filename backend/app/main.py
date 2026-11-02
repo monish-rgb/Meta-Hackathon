@@ -129,6 +129,54 @@ def _normalise_backend_receipt(raw):
     return {"tool_receipt_id": raw}
 
 
+def _receipt_is_pending(receipt) -> bool:
+    """A pending (two-phase, not yet committed) receipt is not proof."""
+    return (
+        isinstance(receipt, dict)
+        and str(receipt.get("state") or "").lower() == "pending"
+    )
+
+
+def _receipt_binding_mismatch(receipt, intent) -> bool:
+    """True when a backend receipt's binding differs from the intent.
+
+    Only fields actually present on the receipt are checked: receipts
+    without a state/binding field (legacy tool-service rows) pass, but a
+    receipt recorded for a different run/resource/payload under the same
+    request_id must never reconcile this intent.
+    """
+    if not isinstance(receipt, dict) or not isinstance(intent, dict):
+        return False
+    for field in ("run_id", "resource_id", "payload_hash", "operation", "request_id"):
+        expected = intent.get(field)
+        if expected is None:
+            continue
+        actual = receipt.get(field)
+        if actual is not None and str(actual) != str(expected):
+            return True
+    return False
+
+
+def _is_request_id_reuse_error(exc) -> bool:
+    """True for the backend 409 request-id binding error.
+
+    The shipped client raises exactly the base ``ToolBackendError`` for
+    409 (see test_backend_classification); test adapters raise a plain
+    ``RuntimeError`` carrying the same ``request-id-reuse`` marker. Both
+    are definitive non-executions for the attempted payload, never an
+    ambiguous outcome.
+    """
+    if exc is None:
+        return False
+    if "request-id-reuse" in str(exc).lower():
+        return True
+    try:
+        from app.tools import ToolBackendError as _BaseError
+    except Exception:
+        return False
+    return type(exc) is _BaseError
+
+
 def _backend_receipt_for_request(tool_client, request_id):
     """Look up a backend receipt by request_id.
 
@@ -183,6 +231,8 @@ def _dispatch_external(tool_client, run_id, resource_id, text, rid, payload_hash
     except ambiguous_cls as exc:
         return "ambiguous", None, None, exc
     except RuntimeError as exc:
+        if _is_request_id_reuse_error(exc):
+            return "reuse", None, None, exc
         return "ambiguous", None, None, exc
     if isinstance(raw, (list, tuple)) and len(raw) == 2:
         return "success", raw[0], raw[1], None
@@ -484,6 +534,43 @@ def _handle_tool_call(
                         ),
                         "event_id": None,
                     }
+                if receipt_info is not None and _receipt_binding_mismatch(
+                    receipt_info, existing_intent
+                ):
+                    # Backend holds this request_id for a different
+                    # binding: it never executed *this* payload. Reject
+                    # as reuse; never fabricate local execution evidence
+                    # from a foreign receipt.
+                    reuse_reason = (
+                        "request_id was already used with a different run, "
+                        "resource, or payload"
+                    )
+                    try:
+                        store.update_execution_intent(
+                            conn, rid, state="failed", error=reuse_reason
+                        )
+                    except Exception:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                    event_id = store.insert_event(
+                        conn, run_id, tool_name, operation, resource_id,
+                        "blocked", "deny", "request-id-reuse", reuse_reason,
+                    )
+                    return 409, {
+                        "decision": "blocked",
+                        "reason": reuse_reason,
+                        "policy_id": "request-id-reuse",
+                        "request_id": rid,
+                        "event_id": event_id,
+                    }
+                if receipt_info is not None and _receipt_is_pending(receipt_info):
+                    # Pending is not proof of execution (file-docs
+                    # two-phase protocol): fall through to redispatch
+                    # under the same request_id, which promotes/completes
+                    # the backend write exactly once.
+                    receipt_info = None
                 if receipt_info is not None:
                     reconciled_tool_receipt_id = (
                         receipt_info.get("tool_receipt_id")
@@ -567,6 +654,25 @@ def _handle_tool_call(
                     "decision": "blocked",
                     "reason": str(dispatch_exc),
                     "policy_id": "tool-backend-unavailable",
+                    "event_id": event_id,
+                    "request_id": rid,
+                }
+            if dispatch_kind == "reuse":
+                reuse_reason = (
+                    "request_id was already used with a different run, "
+                    "resource, or payload"
+                )
+                store.update_execution_intent(
+                    conn, rid, state="failed", error=str(dispatch_exc)
+                )
+                event_id = store.insert_event(
+                    conn, run_id, tool_name, operation, resource_id,
+                    "blocked", "deny", "request-id-reuse", reuse_reason,
+                )
+                return 409, {
+                    "decision": "blocked",
+                    "reason": reuse_reason,
+                    "policy_id": "request-id-reuse",
                     "event_id": event_id,
                     "request_id": rid,
                 }

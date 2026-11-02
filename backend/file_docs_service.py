@@ -8,10 +8,15 @@ credential held by the gateway, never by agent runs. Without the key
 every execution/state/receipt call returns 401 ``tool-key-required``.
 
 Reads/writes are the system of record for externalised file resources.
-Writes go through a temporary file in the same directory followed by
-``os.replace`` so a partially written document is never visible, and the
-execution receipt is inserted in the same unit of work (file replace +
-receipt insert + one SQLite commit).
+Writes use a two-phase receipt protocol: a ``pending`` receipt is
+inserted and committed before the file is touched, the document is then
+written via a temporary file in the same directory followed by
+``os.replace`` (so a partially written document is never visible), and
+finally the receipt is updated to ``committed`` and committed again. A
+failure between phases leaves the durable ``pending`` receipt as the
+recovery record; a retry with the same ``request_id`` either promotes it
+when the file already carries the intended payload or completes the
+write, converging to exactly one ``committed`` receipt.
 
 Receipts are stored in SQLite at ``<root>/.flowgate_receipts.db`` with
 Tier 4 ``request_id``/``payload_hash`` deduplication: a repeated
@@ -26,6 +31,7 @@ Run standalone:
     python -m uvicorn file_docs_service:app --port 8002   (from backend/)
 """
 
+import hashlib
 import os
 import re
 import secrets
@@ -81,10 +87,19 @@ def create_file_docs_app(root_dir=None, service_key: Optional[str] = None) -> Fa
           operation TEXT,
           resource_id TEXT,
           request_id TEXT,
-          payload_hash TEXT
+          payload_hash TEXT,
+          state TEXT NOT NULL DEFAULT 'committed'
         );
         """
     )
+    # Migrate existing DBs created before the two-phase state column.
+    _receipt_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(receipts)").fetchall()
+    }
+    if "state" not in _receipt_columns:
+        conn.execute(
+            "ALTER TABLE receipts ADD COLUMN state TEXT NOT NULL DEFAULT 'committed'"
+        )
     conn.commit()
     lock = threading.Lock()
 
@@ -119,6 +134,40 @@ def create_file_docs_app(root_dir=None, service_key: Optional[str] = None) -> Fa
     def _file_for(resource_id: str) -> Path:
         return resolved_root / f"{resource_id}.txt"
 
+    def _normalised_hash(content: str) -> str:
+        normalised = re.sub(r"\s+", " ", (content or "").lower()).strip()
+        return hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+
+    def _write_file_atomically(path: Path, text: str) -> None:
+        fd, tmp_name = tempfile.mkstemp(dir=str(resolved_root), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                tmp.write(text)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+    def _mark_committed(receipt_id) -> None:
+        try:
+            conn.execute(
+                "UPDATE receipts SET state='committed' WHERE receipt_id=?",
+                (receipt_id,),
+            )
+            conn.commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+
     @application.get("/health")
     def health():
         return {"status": "ok", "service": "flowgate-file-docs"}
@@ -143,6 +192,22 @@ def create_file_docs_app(root_dir=None, service_key: Optional[str] = None) -> Fa
                         and existing.get("run_id") == body.run_id
                         and existing.get("payload_hash") == body.payload_hash
                     ):
+                        if existing.get("state") == "pending" and body.operation == "write":
+                            receipt_id = existing.get("receipt_id")
+                            path = _file_for(body.resource_id)
+                            landed = False
+                            if body.payload_hash is not None and path.exists():
+                                current = path.read_text(encoding="utf-8")
+                                landed = _normalised_hash(current) == body.payload_hash
+                            if not landed:
+                                resolved_root.mkdir(parents=True, exist_ok=True)
+                                _write_file_atomically(path, body.content or "")
+                            _mark_committed(receipt_id)
+                            return {
+                                "receipt_id": receipt_id,
+                                "result": None,
+                                "deduplicated": True,
+                            }
                         if body.operation == "read":
                             path = _file_for(body.resource_id)
                             result = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -166,17 +231,12 @@ def create_file_docs_app(root_dir=None, service_key: Optional[str] = None) -> Fa
             path = _file_for(body.resource_id)
             if body.operation == "write":
                 text = body.content or ""
-                fd, tmp_name = tempfile.mkstemp(
-                    dir=str(resolved_root), suffix=".tmp"
-                )
+                # Phase 1: durable pending receipt before touching the file.
+                # If this insert/commit fails nothing was touched; raise.
                 try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as tmp:
-                        tmp.write(text)
-                        tmp.flush()
-                        os.fsync(tmp.fileno())
                     cur = conn.execute(
-                        "INSERT INTO receipts(ts, run_id, operation, resource_id, request_id, payload_hash)"
-                        " VALUES (?,?,?,?,?,?)",
+                        "INSERT INTO receipts(ts, run_id, operation, resource_id, request_id, payload_hash, state)"
+                        " VALUES (?,?,?,?,?,?,'pending')",
                         (
                             _now(),
                             body.run_id,
@@ -187,19 +247,20 @@ def create_file_docs_app(root_dir=None, service_key: Optional[str] = None) -> Fa
                         ),
                     )
                     receipt_id = cur.lastrowid
-                    os.replace(tmp_name, path)
                     conn.commit()
                 except BaseException:
                     try:
                         conn.rollback()
                     except Exception:
                         pass
-                    try:
-                        if os.path.exists(tmp_name):
-                            os.unlink(tmp_name)
-                    except OSError:
-                        pass
                     raise
+                # Phase 2: temp-file + fsync + os.replace. On failure the
+                # committed pending receipt remains as the recovery record.
+                _write_file_atomically(path, text)
+                # Phase 3: mark committed. On failure the file has changed
+                # and the receipt stays pending (rolled back above in the
+                # helper), which is recoverable on retry — never silent.
+                _mark_committed(receipt_id)
                 result = None
                 return {"receipt_id": receipt_id, "result": result}
             else:

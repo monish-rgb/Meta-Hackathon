@@ -75,6 +75,10 @@ class ToolServiceClient:
             raise ToolBackendError(
                 f"tool backend request-id-reuse ({resp.status_code}): {resp.text}"
             )
+        if resp.status_code >= 500:
+            raise ToolBackendAmbiguous(
+                "tool backend outcome unknown: HTTP 5xx may have committed"
+            )
         if resp.status_code != 200:
             raise ToolBackendNotExecuted(
                 f"tool backend refused execution ({resp.status_code}): {resp.text}"
@@ -115,6 +119,13 @@ class ToolServiceClient:
             receipts = body
         else:
             receipts = []
+        # A pending receipt is not proof of execution (file-docs two-phase
+        # protocol); receipts without a state field pass through.
+        receipts = [
+            r
+            for r in receipts
+            if not (isinstance(r, dict) and r.get("state") == "pending")
+        ]
         if not receipts:
             return None
         return receipts[0]

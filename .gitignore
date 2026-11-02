@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime state (seeded on startup; never commit databases or tokens)
+*.db
+backend/file_docs_data/
+
+# Frontend build output
+frontend/dist/
+
+# Secrets / local env
+.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

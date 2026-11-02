@@ -12,6 +12,7 @@ Run context is backend/; a sys.path fallback keeps pytest working from
 the workspace root.
 """
 
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -24,7 +25,12 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import app.store as store_module  # noqa: E402
 from app.main import create_app  # noqa: E402
-from app.tools import ToolBackendNotExecuted  # noqa: E402
+from app.tools import (  # noqa: E402
+    ToolBackendAmbiguous,
+    ToolBackendError,
+    ToolBackendNotExecuted,
+)
+from file_docs_service import create_file_docs_app  # noqa: E402
 from tool_service import create_tool_app  # noqa: E402
 
 POLICIES_PATH = BACKEND_DIR / "policies.yaml"
@@ -251,6 +257,152 @@ class _ToolClientAdapter:
         return resp.json()
 
 
+# ---------------------------------------------------------------------------
+# File-docs adapter (Tier 5 backend under the Tier 4 outcome rules)
+# ---------------------------------------------------------------------------
+
+class _FileDocsCommitGate:
+    """Fails exactly one numbered commit on the file-docs receipts DB.
+
+    ``sqlite3.Connection.commit`` is read-only on the C type, so the
+    gate is installed via a ``Connection`` subclass (the ``factory``
+    argument) when the file-docs app opens its receipts connection --
+    that connection is the one the service exposes as ``app.state.conn``.
+    ``sqlite3.connect`` is restored immediately after app creation, so
+    the gateway's own database never sees the gated connection class.
+    """
+
+    def __init__(self):
+        self.fail_on_commit = None
+        self.commits_since_arm = 0
+        self.tripped = False
+
+    def arm(self, fail_on_commit: int) -> None:
+        self.fail_on_commit = fail_on_commit
+        self.commits_since_arm = 0
+        self.tripped = False
+
+    def disarm(self) -> None:
+        self.fail_on_commit = None
+
+
+def _create_file_docs_app_with_gate(root_dir, gate, service_key):
+    class _GatedConnection(sqlite3.Connection):
+        def commit(self):  # noqa: D102 - fault-injection wrapper
+            if gate.fail_on_commit is not None:
+                gate.commits_since_arm += 1
+                if gate.commits_since_arm == gate.fail_on_commit:
+                    gate.fail_on_commit = None
+                    gate.tripped = True
+                    raise RuntimeError(
+                        "injected file-docs committed-marking commit failure"
+                    )
+            return super().commit()
+
+    real_connect = sqlite3.connect
+
+    def _connect(*args, **kwargs):
+        kwargs["factory"] = _GatedConnection
+        return real_connect(*args, **kwargs)
+
+    sqlite3.connect = _connect
+    try:
+        return create_file_docs_app(root_dir=str(root_dir), service_key=service_key)
+    finally:
+        sqlite3.connect = real_connect
+
+
+class _FileDocsAdapter:
+    """Adapts a file-docs TestClient to the gateway tool_client API.
+
+    Mirrors ``ToolServiceClient``'s Tier 4 classification against the
+    file-docs backend: 409 is a request-id binding error, 5xx is
+    ambiguous (the two-phase write may have landed), other refusals are
+    definitive non-executions.  ``receipt_for_request`` ignores
+    ``pending`` receipts -- a pending receipt is not proof of
+    execution, so the gateway must redispatch under the same
+    ``request_id`` and let the backend promote/complete the write.
+    """
+
+    KEY = "test-file-docs-key"
+
+    def __init__(self, tmp_path, gate: _FileDocsCommitGate):
+        self.root = tmp_path / "file-docs"
+        self.app = _create_file_docs_app_with_gate(self.root, gate, self.KEY)
+        self.http = TestClient(self.app, raise_server_exceptions=False)
+
+    def execute(self, run_id, operation, resource_id, content=None,
+                request_id=None, payload_hash=None):
+        payload = {"resource_id": resource_id, "operation": operation,
+                   "content": content, "run_id": run_id}
+        if request_id is not None:
+            payload["request_id"] = request_id
+        if payload_hash is not None:
+            payload["payload_hash"] = payload_hash
+        resp = self.http.post(
+            "/execute",
+            json=payload,
+            headers={"X-Tool-Key": self.KEY},
+        )
+        if resp.status_code == 409:
+            raise ToolBackendError(
+                f"tool backend request-id-reuse (409): {resp.text}"
+            )
+        if resp.status_code >= 500:
+            raise ToolBackendAmbiguous(
+                "tool backend outcome unknown: HTTP 5xx may have committed"
+            )
+        if resp.status_code != 200:
+            raise ToolBackendNotExecuted(
+                f"tool backend refused execution ({resp.status_code}): {resp.text}"
+            )
+        body = resp.json()
+        return body.get("result"), body.get("receipt_id")
+
+    def receipt_for_request(self, request_id):
+        resp = self.http.get(
+            "/receipts", params={"request_id": request_id},
+            headers={"X-Tool-Key": self.KEY},
+        )
+        if resp.status_code != 200:
+            raise ToolBackendAmbiguous(
+                f"tool backend receipt lookup failed ({resp.status_code}): {resp.text}"
+            )
+        body = resp.json()
+        receipts = body.get("receipts") if isinstance(body, dict) else body
+        committed = [
+            r for r in (receipts or [])
+            if not (isinstance(r, dict) and r.get("state") == "pending")
+        ]
+        if not committed:
+            return None
+        return committed[0]
+
+    def get_receipt_for_request(self, request_id):
+        return self.receipt_for_request(request_id)
+
+    def state(self, resource_id):
+        resp = self.http.get(
+            f"/state/{resource_id}", headers={"X-Tool-Key": self.KEY}
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+    def receipts(self, run_id=None, resource_id=None, request_id=None):
+        params = {}
+        if run_id:
+            params["run_id"] = run_id
+        if resource_id:
+            params["resource_id"] = resource_id
+        if request_id:
+            params["request_id"] = request_id
+        resp = self.http.get(
+            "/receipts", params=params, headers={"X-Tool-Key": self.KEY}
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+
+
 class _AmbiguousAfterCommitWrapper:
     """Executes for real (backend commits + receipt), then loses the response.
 
@@ -434,6 +586,75 @@ def test_bug_b_audit_failure_after_commit_is_unknown_then_reconciled(
         assert len(_backend_receipts_for_request(adapter, "req-bug-b")) == 1
         assert _gateway_receipt_count(client, writer["run_id"]) == 1
         assert _outbox_version_count(client) == initial_versions + 1
+
+
+# ---------------------------------------------------------------------------
+# File-docs backend: committed-marking failure -> unknown, then recovered
+# ---------------------------------------------------------------------------
+
+def test_file_docs_commit_failure_is_unknown_then_recovers_exactly_once(tmp_path):
+    """Gateway-level reviewer reproduction against the file-docs backend.
+
+    The service's committed-marking commit fails on the first write:
+    the file has changed, the receipt is still ``pending``, and the
+    gateway must report ``unknown`` -- never ``blocked``.  Retrying
+    under the same ``request_id`` promotes the pending receipt (the
+    adapter's receipt lookup returns ``None`` for pending, so the
+    gateway redispatches and the backend self-heals) and completes the
+    gateway audit exactly once.
+    """
+    gate = _FileDocsCommitGate()
+    adapter = _FileDocsAdapter(tmp_path, gate)
+    content = (
+        "File docs gateway message about gardening tools "
+        "and weekend picnic planning notes for outcome checks."
+    )
+    with _make_client(tmp_path, adapter) as client:
+        writer = _create_run(client, "public", 0)
+        initial_versions = _outbox_version_count(client)
+
+        # Commit cadence of one file-docs write, learned in
+        # test_file_docs: commit 1 is the durable pending insert,
+        # commit 2 marks the receipt committed after the replace.
+        gate.arm(2)
+        first = _tool_write(client, writer["token"], content,
+                            request_id="req-file-docs-unknown")
+        body = _body(first)
+        assert gate.tripped is True
+        assert first.status_code == 503, first.text
+        # An ambiguous file-docs outcome is never reported as blocked.
+        assert body.get("decision") == "unknown", body
+        assert body.get("decision") != "blocked", body
+        assert body.get("policy_id") == "execution-outcome-unknown", body
+        assert body.get("request_id") == "req-file-docs-unknown", body
+
+        # The backend file really changed despite the failed call, and
+        # the single backend receipt is still pending.
+        assert adapter.state("public-outbox")["content"] == content
+        pending = _backend_receipts_for_request(
+            adapter, "req-file-docs-unknown"
+        )
+        assert len(pending) == 1, pending
+        assert pending[0].get("state") == "pending", pending
+
+        gate.disarm()
+        retry = _tool_write(client, writer["token"], content,
+                            request_id="req-file-docs-unknown")
+        retry_body = _body(retry)
+        assert retry.status_code == 200, retry.text
+        assert retry_body.get("decision") == "allowed", retry_body
+        assert retry_body.get("request_id") == "req-file-docs-unknown", retry_body
+
+        # Exactly-once everywhere: the pending receipt was promoted, not
+        # duplicated; one gateway receipt; one new artifact version.
+        backend_receipts = _backend_receipts_for_request(
+            adapter, "req-file-docs-unknown"
+        )
+        assert len(backend_receipts) == 1, backend_receipts
+        assert backend_receipts[0].get("state") == "committed", backend_receipts
+        assert _gateway_receipt_count(client, writer["run_id"]) == 1
+        assert _outbox_version_count(client) == initial_versions + 1
+        assert adapter.state("public-outbox")["content"] == content
 
 
 # ---------------------------------------------------------------------------

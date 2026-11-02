@@ -24,7 +24,7 @@ python -m pip install -r requirements.txt
 python -m pytest tests/ -q
 ```
 
-**Expect:** `126 passed`. This covers the detection ladder + containment rung, the policy/flow evaluator, the Tier 1+2 acceptance suite (admin gating incl. fail-closed/demo-mode, twin scenario with artifact creation, restricted payloads, public no-false-positive, restart persistence, atomic write/audit rollback, artifact versions, execution receipts), Tier 3 (challenge mode, mini-eval, agent demo), Tier 4 (external-execution outcomes: unknown state, request-id idempotency, reconciliation), and Tier 5 (spawn contexts, client library, file-docs service).
+**Expect:** `134 passed`. This covers the detection ladder + containment rung, the policy/flow evaluator, the Tier 1+2 acceptance suite (admin gating incl. fail-closed/demo-mode, twin scenario with artifact creation, restricted payloads, public no-false-positive, restart persistence, atomic write/audit rollback, artifact versions, execution receipts), Tier 3 (challenge mode, mini-eval, agent demo), Tier 4 (external-execution outcomes: unknown state, request-id idempotency, reconciliation), and Tier 5 (spawn contexts, client library, file-docs service).
 
 Optional, per layer:
 
