@@ -52,6 +52,27 @@ export default function RunsPanel({ runs, onChanged }: Props) {
                   clearance: {r.clearance} ({CLEARANCE_NAMES[r.clearance] ?? '?'})
                 </span>
                 <span>context: {contextLabel}</span>
+                {r.spawn_mode && (
+                  <span
+                    className={`badge ${
+                      r.spawn_mode === 'clean' ? 'spawn-clean' : 'spawn-continuing'
+                    }`}
+                  >
+                    {r.spawn_mode === 'clean'
+                      ? 'clean spawn'
+                      : r.spawn_mode === 'continuing'
+                        ? 'continuing spawn'
+                        : `${r.spawn_mode} spawn`}
+                  </span>
+                )}
+                {r.parent_run_id && (
+                  <span>
+                    parent:{' '}
+                    <code title={r.parent_run_id}>
+                      {r.parent_run_id.slice(0, 8)}…
+                    </code>
+                  </span>
+                )}
                 {r.suspended && <span className="badge suspended">suspended</span>}
               </div>
             {r.suspended ? (

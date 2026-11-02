@@ -78,12 +78,22 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any, Protocol
+
+# The importable client package lives at the repo root, next to scripts/.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 try:
     import httpx
 except ImportError:  # pragma: no cover - exercised only without httpx
     httpx = None  # type: ignore[assignment]
+
+from flowgate_client import FlowGateClientError, GatewayClient  # noqa: E402
+
+__all__ = ["GatewayClient"]
 
 # Anthropic-planner default ONLY (never used by Gemini/OpenAI-compatible
 # planners, which carry their own provider defaults below).
@@ -120,128 +130,6 @@ class UnavailableError(RuntimeError):
 
 def _tool_name_for(resource_id: str) -> str:
     return "shared_kv" if resource_id in _KV_RESOURCES else "shared_doc"
-
-
-class _SyncFromAsyncTransport(httpx.BaseTransport if httpx is not None else object):
-    """Adapt an async-only transport (httpx.ASGITransport) for the
-    synchronous client, so tests can drive an ASGI app in-process."""
-
-    def __init__(self, async_transport: Any) -> None:
-        self._async_transport = async_transport
-
-    def handle_request(self, request):  # type: ignore[override]
-        import anyio
-
-        content = request.read()
-
-        async def _send():
-            async with httpx.AsyncClient(
-                transport=self._async_transport, timeout=15.0
-            ) as async_client:
-                resp = await async_client.request(
-                    request.method,
-                    request.url,
-                    headers=request.headers,
-                    content=content,
-                )
-                return resp.status_code, resp.headers, resp.content
-
-        status, headers, body = anyio.run(_send)
-        return httpx.Response(
-            status_code=status, headers=headers, content=body, request=request
-        )
-
-    def close(self) -> None:  # sync transports close best-effort only
-        pass
-
-
-class GatewayClient:
-    """Minimal external gateway client (httpx).
-
-    ``transport`` may be an ``httpx`` transport (for tests driving an
-    ASGI app in-process); otherwise a normal network client is used.
-    """
-
-    def __init__(
-        self,
-        base_url: str,
-        admin_key: str | None = None,
-        transport: Any = None,
-        timeout: float = 15.0,
-    ) -> None:
-        if httpx is None:  # pragma: no cover
-            raise UnavailableError("httpx is not installed")
-        self.base_url = base_url.rstrip("/")
-        self.admin_key = admin_key
-        if transport is not None and not hasattr(transport, "handle_request"):
-            # Async-only transport (e.g. httpx.ASGITransport in tests):
-            # adapt it so the synchronous client can use it.
-            transport = _SyncFromAsyncTransport(transport)
-        self._client = httpx.Client(
-            base_url=self.base_url, transport=transport, timeout=timeout
-        )
-
-    def close(self) -> None:
-        try:
-            self._client.close()
-        except Exception:
-            # Some in-process transports (ASGI test transports) have no
-            # synchronous close; closing is best-effort cleanup only.
-            pass
-
-    def __enter__(self) -> "GatewayClient":
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.close()
-
-    def create_run(self, project: str, clearance: int) -> dict:
-        """Create a run (admin key only here; tool calls use the token)."""
-        headers = {"X-Admin-Key": self.admin_key} if self.admin_key else {}
-        resp = self._client.post(
-            "/runs",
-            json={"project": project, "clearance": clearance},
-            headers=headers,
-        )
-        if resp.status_code != 201:
-            raise RuntimeError(
-                f"run creation failed: HTTP {resp.status_code} {resp.text}"
-            )
-        return resp.json()
-
-    def tool_call(
-        self,
-        token: str,
-        tool_name: str,
-        operation: str,
-        resource_id: str,
-        content: str | None = None,
-    ) -> tuple[int, dict]:
-        body: dict[str, Any] = {"operation": operation, "resource_id": resource_id}
-        if content is not None:
-            body["content"] = content
-        resp = self._client.post(
-            f"/tools/{tool_name}",
-            json=body,
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        try:
-            payload = resp.json()
-        except ValueError:
-            payload = {}
-        return resp.status_code, payload if isinstance(payload, dict) else {}
-
-    def gateway_tool(
-        self,
-        token: str,
-        operation: str,
-        resource_id: str,
-        content: str | None = None,
-    ) -> tuple[int, dict]:
-        """Execute one gateway_tool proposal via the matching real tool."""
-        return self.tool_call(
-            token, _tool_name_for(resource_id), operation, resource_id, content
-        )
 
 
 def _verdict(operation: str, resource_id: str, status: int, body: dict) -> dict:
@@ -815,6 +703,14 @@ def main(argv: list[str] | None = None) -> int:
                     "or pass --llm-api-key. Falling back to the scripted planner."
                 )
                 verdicts = ScriptedPlanner().run(client, token)
+    except FlowGateClientError as exc:
+        # The extracted client renames this script's old httpx-missing
+        # error to FlowGateClientError; preserve the original surface
+        # (and therefore the planners' UnavailableError fallback
+        # behaviour) when httpx itself is unavailable.
+        if httpx is None:
+            raise UnavailableError(str(exc)) from exc
+        raise
     except Exception as exc:
         if httpx is not None and isinstance(
             exc, (httpx.ConnectError, httpx.TimeoutException)

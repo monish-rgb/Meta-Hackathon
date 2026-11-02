@@ -147,6 +147,18 @@ button.secondary:hover:not(:disabled) {
   border: 1px solid #ff5a5a;
 }
 
+.badge.spawn-clean {
+  background: #12382e;
+  color: #7dffa8;
+  border: 1px solid #4caf7d;
+}
+
+.badge.spawn-continuing {
+  background: #2d2108;
+  color: #f0b429;
+  border: 1px solid #d29922;
+}
+
 .feed {
   display: flex;
   flex-direction: column;
@@ -341,6 +353,12 @@ code {
 
 .legend-blocked {
   color: #ff8a8a;
+}
+
+.legend-spawn {
+  color: #c586ff;
+  border-bottom: 2px dashed #c586ff;
+  padding-bottom: 1px;
 }
 
 .node-title {

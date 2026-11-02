@@ -1,4 +1,4 @@
-"""FlowGate seed data: the ten contract resources."""
+"""FlowGate seed data: the thirteen contract resources."""
 
 from app.store import upsert_resource
 
@@ -63,7 +63,7 @@ ALPHA_DRAFT_CONTENT = (
 
 
 def seed_data(conn) -> None:
-    """Upsert exactly the ten contract resources."""
+    """Upsert exactly the thirteen contract resources."""
     upsert_resource(conn, "alpha-roadmap", "doc", "alpha", 2, ROADMAP_CONTENT)
     upsert_resource(conn, "alpha-notes", "doc", "alpha", 1, ALPHA_NOTES_CONTENT)
     upsert_resource(conn, "beta-notes", "doc", "beta", 1, BETA_NOTES_CONTENT)
@@ -74,3 +74,6 @@ def seed_data(conn) -> None:
     upsert_resource(conn, "public-draft", "doc", "shared", 0, "")
     upsert_resource(conn, "public-outbox", "kv", "shared", 0, "")
     upsert_resource(conn, "challenge-outbox", "kv", "shared", 0, "")
+    upsert_resource(conn, "tenant-alpha-brief", "doc", "alpha", 2, "")
+    upsert_resource(conn, "tenant-beta-brief", "doc", "beta", 2, "")
+    upsert_resource(conn, "published-releases", "doc", "shared", 0, "")

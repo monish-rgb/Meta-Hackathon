@@ -62,6 +62,13 @@ label built from reads, not just who the run is:
 
 Also runnable headless: start the backend, then `python scripts/demo.py --admin-key <key>` (step 9 externally re-verifies that the denied write produced no tool execution receipt). API-only: `POST /demo/run`, `POST /demo/reset` (both admin-gated).
 
+## Real-workflow integration (Tier 5)
+
+- **Client library** — `flowgate_client/` is an importable httpx client (`create_run`, tool calls, artifacts, receipts/intents); `scripts/agent_demo.py` runs one real-LLM step through it (the model proposes, the gateway disposes; restricted content never enters model context).
+- **File-docs connector** — `backend/file_docs_service.py` serves real document files behind the same gateway-held key + request-id dedupe protocol, so tenant documents live outside the gateway store.
+- **Clean-context spawning** — a controller can spawn a `clean` run (fresh label, recorded lineage, for innocent public output) or a `continuing` run (server-side inherits the parent's current label — a fresh token never launders provenance). Suspension means exactly that a run's gateway access is revoked.
+- **Flagship demo** — `python scripts/tenant_assistant_demo.py` boots both services and runs the multi-tenant story end-to-end: private brief → inherited-label draft → blocked publish → cross-tenant block → clean spawn publishes, continuing spawn blocked.
+
 ## Tests
 
 ```powershell

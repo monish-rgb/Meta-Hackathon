@@ -11,6 +11,8 @@ class RunCreate(BaseModel):
     clearance: int = Field(ge=0, le=2)
     effective_level: int = Field(default=0, ge=0, le=2)
     effective_compartments: List[str] = Field(default_factory=list)
+    parent_run_id: Optional[str] = None
+    spawn_mode: Optional[Literal["clean", "continuing"]] = None
 
 
 class ToolCallRequest(BaseModel):

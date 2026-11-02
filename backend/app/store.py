@@ -47,6 +47,14 @@ def _run_dict(row) -> dict:
         tenant = row["tenant"]
     except (KeyError, IndexError):
         tenant = None
+    try:
+        parent_run_id = row["parent_run_id"]
+    except (KeyError, IndexError):
+        parent_run_id = None
+    try:
+        spawn_mode = row["spawn_mode"]
+    except (KeyError, IndexError):
+        spawn_mode = None
     return {
         "run_id": row["run_id"],
         "project": row["project"],
@@ -56,6 +64,8 @@ def _run_dict(row) -> dict:
         "created_at": row["created_at"],
         "effective_level": effective_level,
         "effective_compartments": _parse_compartments(row),
+        "parent_run_id": parent_run_id,
+        "spawn_mode": spawn_mode,
     }
 
 
@@ -122,7 +132,9 @@ def init_db(db_path) -> sqlite3.Connection:
           token TEXT UNIQUE NOT NULL,
           created_at TEXT NOT NULL,
           effective_level INTEGER NOT NULL DEFAULT 0,
-          effective_compartments TEXT NOT NULL DEFAULT '[]'
+          effective_compartments TEXT NOT NULL DEFAULT '[]',
+          parent_run_id TEXT,
+          spawn_mode TEXT
         );
         CREATE TABLE IF NOT EXISTS resources(
           resource_id TEXT PRIMARY KEY,
@@ -215,6 +227,10 @@ def init_db(db_path) -> sqlite3.Connection:
         )
     if "tenant" not in existing:
         conn.execute("ALTER TABLE runs ADD COLUMN tenant TEXT NOT NULL DEFAULT ''")
+    if "parent_run_id" not in existing:
+        conn.execute("ALTER TABLE runs ADD COLUMN parent_run_id TEXT")
+    if "spawn_mode" not in existing:
+        conn.execute("ALTER TABLE runs ADD COLUMN spawn_mode TEXT")
     # Existing runs belong to the tenant named by their project.
     conn.execute("UPDATE runs SET tenant = project WHERE tenant = ''")
     # Migrate pre-Tier-2 databases whose resources table lacks the
@@ -270,7 +286,7 @@ def _normalise_compartments(compartments) -> list:
 
 def create_run(
     conn, project, clearance, token, effective_level=0, effective_compartments=None,
-    tenant=None,
+    tenant=None, parent_run_id=None, spawn_mode=None,
 ) -> dict:
     run_id = uuid.uuid4().hex[:16]
     created_at = _now()
@@ -282,9 +298,9 @@ def create_run(
     compartments = _normalise_compartments(effective_compartments)
     conn.execute(
         "INSERT INTO runs(run_id, project, tenant, clearance, suspended, token, created_at,"
-        " effective_level, effective_compartments)"
-        " VALUES (?,?,?,?,?,?,?,?,?)",
-        (run_id, project, tenant, clearance, 0, token, created_at, level, json.dumps(compartments)),
+        " effective_level, effective_compartments, parent_run_id, spawn_mode)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (run_id, project, tenant, clearance, 0, token, created_at, level, json.dumps(compartments), parent_run_id, spawn_mode),
     )
     conn.commit()
     created = get_run(conn, run_id) or {
@@ -296,6 +312,8 @@ def create_run(
         "created_at": created_at,
         "effective_level": level,
         "effective_compartments": compartments,
+        "parent_run_id": parent_run_id,
+        "spawn_mode": spawn_mode,
     }
     created["token"] = token
     return created

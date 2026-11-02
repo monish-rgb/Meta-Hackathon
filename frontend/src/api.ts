@@ -37,6 +37,8 @@ export interface Run {
   created_at: string;
   effective_level: number;
   effective_compartments: string[];
+  parent_run_id?: string | null;
+  spawn_mode?: string | null;
 }
 
 export interface Resource {

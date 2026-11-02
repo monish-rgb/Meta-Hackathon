@@ -53,17 +53,26 @@ export default function LineageGraph({ nodes, edges }: Props) {
 
   const rfEdges: Edge[] = useMemo(
     () =>
-      edges.map((e: GraphEdge) => ({
-        id: e.id,
-        source: e.source,
-        target: e.target,
-        label: `${e.operation} · ${e.policy_id}`,
-        animated: e.decision === 'blocked',
-        style: {
-          stroke: e.decision === 'blocked' ? '#ff5a5a' : '#4caf7d',
-          strokeWidth: 2,
-        },
-      })),
+      edges.map((e: GraphEdge) => {
+        const isSpawn = e.operation === 'spawn';
+        const isBlocked = e.decision === 'blocked';
+        return {
+          id: e.id,
+          source: e.source,
+          target: e.target,
+          label: isSpawn
+            ? e.policy_id
+              ? `spawn · ${e.policy_id}`
+              : 'spawn'
+            : `${e.operation} · ${e.policy_id}`,
+          animated: isBlocked,
+          style: {
+            stroke: isBlocked ? '#ff5a5a' : isSpawn ? '#c586ff' : '#4caf7d',
+            strokeWidth: 2,
+            ...(isSpawn ? { strokeDasharray: '6 4' } : {}),
+          },
+        };
+      }),
     [edges],
   );
 
@@ -77,7 +86,10 @@ export default function LineageGraph({ nodes, edges }: Props) {
         <span className="legend-run">run</span>
         <span className="legend-resource">resource</span>
         <span className="legend-blocked">blocked edge</span>
-        <span className="muted">reads: resource → run · writes: run → resource</span>
+        <span className="legend-spawn">spawn edge (dashed)</span>
+        <span className="muted">
+          reads: resource → run · writes: run → resource · spawns: run → run
+        </span>
       </div>
       <div style={{ height: 420 }}>
         <ReactFlow nodes={rfNodes} edges={rfEdges} fitView>

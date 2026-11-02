@@ -573,3 +573,60 @@ atomicity:
   dispatches. Transport attempts, logical backend executions, and
   committed objects remain three distinct counts.
 
+---
+
+# Tier 5 Amendment — client library, file-docs connector, clean-context spawning
+
+Additive; the Tier 1–4 deterministic core is unchanged.
+
+## Client library (no gateway semantics)
+
+- `flowgate_client/` at the repo root is the importable client package
+  (httpx-based), extracted from the `GatewayClient` in
+  `scripts/agent_demo.py`, which now imports it. It exposes run
+  creation, tool calls, artifact creation, and receipt/intent listing.
+  Scripts locate it via the repo root on `sys.path`; no gateway
+  behaviour changes.
+
+## File-docs external backend
+
+- `backend/file_docs_service.py` is a second protected backend with the
+  same execution protocol as `tool_service.py` (`POST /execute`,
+  `GET /state/{resource_id}`, `GET /receipts`, `X-Tool-Key` only,
+  `request_id`/`payload_hash` deduplication with receipts stored beside
+  the documents). A resource_id maps to exactly one file
+  `<root>/<resource_id>.txt`; resource_ids must match
+  `^[a-z0-9][a-z0-9-_]*$` (no path traversal). Reads/writes are the
+  system of record for externalised file resources.
+- Seeded gateway resources for the tenant workflow: `tenant-alpha-brief`
+  (doc, alpha, 2), `tenant-beta-brief` (doc, beta, 2),
+  `published-releases` (doc, shared, 0). Their gateway-side content is
+  empty; content lives in the file backend when externalised.
+- The gateway accepts `FLOWGATE_EXTERNAL_RESOURCES` (comma-separated)
+  to choose which resources externalise when a tool client is
+  configured; the `{"public-outbox"}` default is unchanged.
+
+## Clean-context spawning (runs)
+
+- `RunCreate` gains optional `parent_run_id` and
+  `spawn_mode: "clean" | "continuing"`. Run creation remains admin-only.
+  - `continuing`: the server sets the child's initial effective label
+    to the parent's **current** effective label (client-supplied
+    `effective_level`/`effective_compartments` are ignored); the child
+    inherits the parent's project/tenant/clearance unless explicitly
+    overridden by the controller.
+  - `clean`: the child's effective label starts at `(0, [])`
+    regardless of client-supplied values. Clean means *no context is
+    transferred*; the spawn is recorded so the claim is auditable, and
+    feeding the clean run the parent's restricted context would be
+    laundering outside this API's guarantee.
+  - Unknown `parent_run_id` → 422. Runs record `parent_run_id` and
+    `spawn_mode`; the graph adds a `spawn` edge (parent run → child
+    run). A fresh token alone never changes a label: rotation/reissue
+    is a controller act, and `continuing` is how provenance survives it.
+- Declassification remains **not implemented** (future: trusted
+  approver bound to artifact version hash, destination, and expiry;
+  an agent can never approve its own declassification). Suspension
+  means exactly "this run's gateway access is revoked"; it does not
+  claim any worker process was stopped.
+

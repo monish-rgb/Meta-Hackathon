@@ -929,11 +929,18 @@ def create_app(
                 or ""
             )
             resolved_tool_client = ToolServiceClient(url, key)
-    resolved_external = (
-        set(external_resources)
-        if external_resources is not None
-        else ({"public-outbox"} if resolved_tool_client is not None else set())
-    )
+    if external_resources is not None:
+        resolved_external = set(external_resources)
+    elif os.environ.get("FLOWGATE_EXTERNAL_RESOURCES") is not None:
+        resolved_external = {
+            part.strip()
+            for part in os.environ["FLOWGATE_EXTERNAL_RESOURCES"].split(",")
+            if part.strip()
+        }
+    else:
+        resolved_external = (
+            {"public-outbox"} if resolved_tool_client is not None else set()
+        )
 
     application = FastAPI(title="FlowGate")
 
@@ -1006,15 +1013,54 @@ def create_app(
         with state.lock:
             if not _is_admin(authorization, x_admin_key):
                 return _admin_denied()
+            project = body.project
+            clearance = body.clearance
+            tenant = body.tenant
+            effective_level = body.effective_level
+            effective_compartments = body.effective_compartments
+            if body.parent_run_id:
+                if not body.spawn_mode:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="spawn_mode is required when parent_run_id is provided",
+                    )
+                parent = store.get_run(state.conn, body.parent_run_id)
+                if parent is None:
+                    raise HTTPException(
+                        status_code=422, detail="Unknown parent run"
+                    )
+                if body.spawn_mode == "continuing":
+                    # Server wins for continuing spawns: the child inherits
+                    # the parent's current effective label and its
+                    # project/tenant/clearance, ignoring any client-supplied
+                    # project, tenant, clearance, or effective label values,
+                    # so a fresh token cannot launder provenance.
+                    effective_level = parent.get("effective_level", 0)
+                    effective_compartments = parent.get(
+                        "effective_compartments", []
+                    )
+                    project = parent.get("project")
+                    tenant = parent.get("tenant") or parent.get("project")
+                    clearance = parent.get("clearance")
+                elif body.spawn_mode == "clean":
+                    effective_level = 0
+                    effective_compartments = []
+            elif body.spawn_mode:
+                raise HTTPException(
+                    status_code=422,
+                    detail="parent_run_id is required when spawn_mode is provided",
+                )
             token = create_token()
             return store.create_run(
                 state.conn,
-                body.project,
-                body.clearance,
+                project,
+                clearance,
                 token,
-                effective_level=body.effective_level,
-                effective_compartments=body.effective_compartments,
-                tenant=body.tenant,
+                effective_level=effective_level,
+                effective_compartments=effective_compartments,
+                tenant=tenant,
+                parent_run_id=body.parent_run_id,
+                spawn_mode=body.spawn_mode,
             )
 
     @application.get("/runs")
@@ -1288,6 +1334,20 @@ def create_app(
                         "policy_id": e.get("policy_id"),
                     }
                 )
+            for r in runs:
+                if r.get("parent_run_id"):
+                    edges.append(
+                        {
+                            "id": "spawn:{}".format(r["run_id"]),
+                            "source": "run:{}".format(r["parent_run_id"]),
+                            "target": "run:{}".format(r["run_id"]),
+                            "operation": "spawn",
+                            "decision": "allowed",
+                            "policy_id": "spawn-{}".format(
+                                r.get("spawn_mode") or "clean"
+                            ),
+                        }
+                    )
             return {"nodes": nodes, "edges": edges}
 
     @application.post("/demo/reset")

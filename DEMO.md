@@ -24,7 +24,7 @@ python -m pip install -r requirements.txt
 python -m pytest tests/ -q
 ```
 
-**Expect:** `89 passed`. This covers the detection ladder + containment rung, the policy/flow evaluator, and the Tier 1+2 acceptance suite (admin gating incl. fail-closed/demo-mode, twin scenario with artifact creation, restricted payloads, public no-false-positive, restart persistence, atomic write/audit rollback, artifact versions, execution receipts).
+**Expect:** `126 passed`. This covers the detection ladder + containment rung, the policy/flow evaluator, the Tier 1+2 acceptance suite (admin gating incl. fail-closed/demo-mode, twin scenario with artifact creation, restricted payloads, public no-false-positive, restart persistence, atomic write/audit rollback, artifact versions, execution receipts), Tier 3 (challenge mode, mini-eval, agent demo), Tier 4 (external-execution outcomes: unknown state, request-id idempotency, reconciliation), and Tier 5 (spawn contexts, client library, file-docs service).
 
 Optional, per layer:
 
@@ -111,6 +111,21 @@ python scripts/demo.py --admin-key flowgate-dev-admin --tool-service-url http://
 | 1–4 | Public collaboration: A reads `public-source` → writes `public-draft` → B reads it → publishes to `public-outbox` | All allowed, content lands |
 | 5–7 | Restricted collaboration: A reads `alpha-roadmap` → **creates** `alpha-plan-draft` (server assigns the inherited secret/alpha label, version 1) → B reads only the draft | All allowed internally; B's effective label becomes `secret {alpha}` |
 | 8 | B tries to publish the draft to `public-outbox` | Blocked `deny-write-down`, not suspended, outbox unchanged, no execution receipt |
+
+### Flagship: multi-tenant assistant over real files (Tier 5, one command)
+
+```powershell
+# from repo root — boots the file-docs backend + gateway itself, tears down after
+python scripts/tenant_assistant_demo.py
+```
+
+**Expect:** 7/7 PASS. An Alpha tenant assistant reads its private brief from the
+file-docs backend (real files, gateway-held key), creates an inherited-label draft,
+is blocked publishing it (`deny-write-down`, destination file untouched, zero write
+receipts); a Beta assistant cannot read Alpha's brief; a controller-spawned **clean**
+context publishes an innocent public notice successfully, while a **continuing**
+context is blocked doing the same innocent write — a fresh token does not launder
+provenance. Add `--keep-running` to inspect the two services afterwards.
 
 ---
 
