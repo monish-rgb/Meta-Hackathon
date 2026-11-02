@@ -514,3 +514,62 @@ better.
   backend (gateway-held tool key, no direct agent access). Event/alert
   reasons never contain canary values (unchanged invariant).
 
+---
+
+# Tier 4 Amendment — external-execution outcomes (unknown, idempotency, reconciliation)
+
+Supersedes the Tier 2 receipt wording where externalised resources are
+concerned. Local (in-process) execution keeps the Tier 2 atomic
+transaction guarantee unchanged. For resources executed on the separate
+tool backend, a local transaction cannot span the service boundary, so
+external writes use a durable outcome state machine instead of claiming
+atomicity:
+
+- **Request IDs.** `ToolCallRequest` accepts an optional `request_id`
+  (`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`). For an externalised write the
+  gateway uses the supplied ID or generates one, returns it as
+  `request_id` in every outcome response for that call, and binds it to
+  (run, tool, operation, resource, SHA-256 of normalised content).
+  Reusing a `request_id` with a different binding is rejected
+  409 `request-id-reuse` and executes nothing.
+- **Durable intent before dispatch.** Before dispatching an external
+  write the gateway commits an `execution_intents` row
+  (`authorized_intent`). Intent states: `authorized_intent`,
+  `dispatched`, `committed`, `failed`, `unknown`. `GET
+  /execution-intents` (admin) lists them for evidence/reconciliation.
+- **Backend deduplication.** The tool service stores `request_id` and
+  `payload_hash` on its receipts (migrating existing DBs). A repeated
+  `/execute` with the same `request_id` and binding returns the
+  original `receipt_id` without re-executing or inserting a second
+  receipt; a mismatched binding returns 409. `GET /receipts` accepts a
+  `request_id` filter.
+- **Outcome honesty.** A backend failure is `blocked`
+  (`tool-backend-unavailable`, 503) **only** when execution is
+  definitively known not to have happened (connection refused before
+  dispatch, or a non-200 refusal received from the backend). When the
+  outcome is ambiguous (response lost/timeout after dispatch may have
+  committed, or the gateway's own audit transaction failed after a
+  successful dispatch) the response is HTTP 503 (dispatch ambiguity) or
+  500 (post-dispatch audit failure) with `decision: "unknown"`,
+  `policy_id: "execution-outcome-unknown"`, the `request_id`, and the
+  backend `tool_receipt_id` when known. It is never reported as
+  `blocked`, and no `blocked` event is recorded for it; an `unknown`
+  event is recorded whenever the audit store is writable.
+- **Reconciliation before retry.** Retrying an external write with the
+  same `request_id`: a `committed` intent replays the original 200
+  outcome (`replayed: true`, original receipt/event IDs, no new
+  execution, version, or backend receipt). An `unknown`/`dispatched`
+  intent is first reconciled against the backend by `request_id`: if a
+  backend receipt exists, the gateway completes its local
+  version+receipt+event transaction exactly once and returns 200
+  (`reconciled: true`); if none exists and the backend answers, the
+  write is redispatched under the same `request_id`; if the backend
+  cannot be queried, the call returns `unknown` again. If the local
+  audit transaction fails during reconciliation the outcome stays
+  `unknown` for a further retry.
+- Scope honesty restated: "blocked before execution" may be claimed
+  only for pre-dispatch denials (zero backend transport executions for
+  that request). A denied-by-policy/flow/scanner call still never
+  dispatches. Transport attempts, logical backend executions, and
+  committed objects remain three distinct counts.
+

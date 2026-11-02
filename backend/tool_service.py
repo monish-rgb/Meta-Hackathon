@@ -34,6 +34,8 @@ class ExecuteRequest(BaseModel):
     operation: str  # read | write
     content: Optional[str] = None
     run_id: Optional[str] = None
+    request_id: Optional[str] = None
+    payload_hash: Optional[str] = None
 
 
 def create_tool_app(db_path: Optional[str] = None, service_key: Optional[str] = None) -> FastAPI:
@@ -60,10 +62,20 @@ def create_tool_app(db_path: Optional[str] = None, service_key: Optional[str] = 
           ts TEXT NOT NULL,
           run_id TEXT,
           operation TEXT,
-          resource_id TEXT
+          resource_id TEXT,
+          request_id TEXT,
+          payload_hash TEXT
         );
         """
     )
+    # Migrate existing DBs created before Tier 4 idempotency columns.
+    _receipt_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(receipts)").fetchall()
+    }
+    if "request_id" not in _receipt_columns:
+        conn.execute("ALTER TABLE receipts ADD COLUMN request_id TEXT")
+    if "payload_hash" not in _receipt_columns:
+        conn.execute("ALTER TABLE receipts ADD COLUMN payload_hash TEXT")
     conn.commit()
 
     application = FastAPI(title="FlowGate Tool Backend")
@@ -91,6 +103,36 @@ def create_tool_app(db_path: Optional[str] = None, service_key: Optional[str] = 
     def execute(body: ExecuteRequest, x_tool_key: Optional[str] = Header(None, alias="X-Tool-Key")):
         if not _is_service(x_tool_key):
             return _unauthorized()
+        if body.request_id:
+            existing_row = conn.execute(
+                "SELECT * FROM receipts WHERE request_id = ? ORDER BY receipt_id LIMIT 1",
+                (body.request_id,),
+            ).fetchone()
+            if existing_row is not None:
+                existing = dict(existing_row)
+                if (
+                    existing.get("resource_id") == body.resource_id
+                    and existing.get("operation") == body.operation
+                    and existing.get("run_id") == body.run_id
+                    and existing.get("payload_hash") == body.payload_hash
+                ):
+                    if body.operation == "read":
+                        row = conn.execute(
+                            "SELECT content FROM kv WHERE resource_id = ?",
+                            (body.resource_id,),
+                        ).fetchone()
+                        result = row["content"] if row else ""
+                    else:
+                        result = None
+                    return {
+                        "receipt_id": existing.get("receipt_id"),
+                        "result": result,
+                        "deduplicated": True,
+                    }
+                return JSONResponse(
+                    status_code=409,
+                    content={"decision": "blocked", "policy_id": "request-id-reuse"},
+                )
         if body.operation not in ("read", "write"):
             return JSONResponse(
                 status_code=400,
@@ -109,8 +151,16 @@ def create_tool_app(db_path: Optional[str] = None, service_key: Optional[str] = 
             ).fetchone()
             result = row["content"] if row else ""
         cur = conn.execute(
-            "INSERT INTO receipts(ts, run_id, operation, resource_id) VALUES (?,?,?,?)",
-            (_now(), body.run_id, body.operation, body.resource_id),
+            "INSERT INTO receipts(ts, run_id, operation, resource_id, request_id, payload_hash)"
+            " VALUES (?,?,?,?,?,?)",
+            (
+                _now(),
+                body.run_id,
+                body.operation,
+                body.resource_id,
+                body.request_id,
+                body.payload_hash,
+            ),
         )
         conn.commit()
         return {"receipt_id": cur.lastrowid, "result": result}
@@ -132,6 +182,7 @@ def create_tool_app(db_path: Optional[str] = None, service_key: Optional[str] = 
     def get_receipts(
         run_id: Optional[str] = None,
         resource_id: Optional[str] = None,
+        request_id: Optional[str] = None,
         x_tool_key: Optional[str] = Header(None, alias="X-Tool-Key"),
     ):
         if not _is_service(x_tool_key):
@@ -144,6 +195,9 @@ def create_tool_app(db_path: Optional[str] = None, service_key: Optional[str] = 
         if resource_id is not None:
             clauses.append("resource_id = ?")
             params.append(resource_id)
+        if request_id is not None:
+            clauses.append("request_id = ?")
+            params.append(request_id)
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY receipt_id"

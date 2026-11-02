@@ -4,6 +4,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -32,6 +33,15 @@ from app.policy import (
     run_effective_label,
 )
 from app.tools import TOOL_KIND, ToolServiceClient, execute_tool
+
+try:  # Tier 4 typed backend errors (added concurrently in app.tools).
+    from app.tools import ToolBackendAmbiguous, ToolBackendNotExecuted
+except Exception:  # pragma: no cover - defensive fallback
+    class ToolBackendNotExecuted(RuntimeError):
+        """Execution definitively did not happen on the tool backend."""
+
+    class ToolBackendAmbiguous(RuntimeError):
+        """Execution may have committed on the tool backend."""
 
 
 def _default_db_path() -> str:
@@ -75,9 +85,120 @@ def _ensure_seed_fingerprints(conn) -> None:
         existing.add(key)
 
 
+def _tool_backend_exc_types():
+    """Resolve the typed backend-error classes, preferring app.tools."""
+    try:
+        from app.tools import (
+            ToolBackendAmbiguous as _Ambiguous,
+            ToolBackendNotExecuted as _NotExecuted,
+        )
+
+        return _NotExecuted, _Ambiguous
+    except Exception:
+        return ToolBackendNotExecuted, ToolBackendAmbiguous
+
+
+def _normalise_backend_receipt(raw):
+    """Normalise a backend receipt lookup result to a dict or None."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return {"tool_receipt_id": raw, "receipt_id": raw}
+    if isinstance(raw, (list, tuple)):
+        if not raw:
+            return None
+        return _normalise_backend_receipt(raw[0])
+    if isinstance(raw, dict):
+        if isinstance(raw.get("receipts"), (list, tuple)):
+            receipts = raw["receipts"]
+            if not receipts:
+                return None
+            return _normalise_backend_receipt(receipts[0])
+        if "receipt" in raw:
+            return _normalise_backend_receipt(raw.get("receipt"))
+        if raw.get("count") == 0 and not raw.get("receipt_id"):
+            return None
+        receipt_id = raw.get(
+            "receipt_id", raw.get("tool_receipt_id", raw.get("id"))
+        )
+        if receipt_id is None and not raw:
+            return None
+        normalised = dict(raw)
+        normalised["tool_receipt_id"] = receipt_id
+        return normalised
+    return {"tool_receipt_id": raw}
+
+
+def _backend_receipt_for_request(tool_client, request_id):
+    """Look up a backend receipt by request_id.
+
+    Returns ``(receipt_dict_or_None, lookup_available)``. ``lookup_available``
+    is False when the client offers no receipt-by-request lookup or the
+    lookup itself fails — in that case the caller must not redispatch.
+    """
+    receipt_fn = getattr(tool_client, "receipt_for_request", None)
+    if callable(receipt_fn):
+        try:
+            try:
+                raw = receipt_fn(request_id)
+            except TypeError:
+                raw = receipt_fn(request_id=request_id)
+        except Exception:
+            return None, False
+        return _normalise_backend_receipt(raw), True
+    receipts_fn = getattr(tool_client, "receipts_for_request", None)
+    if callable(receipts_fn):
+        try:
+            try:
+                raw = receipts_fn(request_id)
+            except TypeError:
+                raw = receipts_fn(request_id=request_id)
+        except Exception:
+            return None, False
+        return _normalise_backend_receipt(raw), True
+    return None, False
+
+
+def _dispatch_external(tool_client, run_id, resource_id, text, rid, payload_hash):
+    """Dispatch an external write, classifying the outcome.
+
+    Returns ``(kind, result, tool_receipt_id, error)`` where ``kind`` is
+    ``"success"``, ``"definitive"`` (execution is known not to have
+    happened) or ``"ambiguous"`` (execution may have committed). Legacy
+    clients without ``request_id``/``payload_hash`` kwargs are retried
+    without them on ``TypeError``. Plain ``RuntimeError`` is treated as
+    ambiguous (the safe default); other exceptions propagate.
+    """
+    not_executed_cls, ambiguous_cls = _tool_backend_exc_types()
+    try:
+        try:
+            raw = tool_client.execute(
+                run_id, "write", resource_id, text,
+                request_id=rid, payload_hash=payload_hash,
+            )
+        except TypeError:
+            raw = tool_client.execute(run_id, "write", resource_id, text)
+    except not_executed_cls as exc:
+        return "definitive", None, None, exc
+    except ambiguous_cls as exc:
+        return "ambiguous", None, None, exc
+    except RuntimeError as exc:
+        return "ambiguous", None, None, exc
+    if isinstance(raw, (list, tuple)) and len(raw) == 2:
+        return "success", raw[0], raw[1], None
+    if isinstance(raw, dict):
+        return (
+            "success",
+            raw.get("result"),
+            raw.get("receipt_id", raw.get("tool_receipt_id")),
+            None,
+        )
+    return "success", raw, None, None
+
+
 def _handle_tool_call(
     conn, rules, run, tool_name, operation, resource_id, content,
-    tool_client=None, external_resources=frozenset(),
+    tool_client=None, external_resources=frozenset(), request_id=None,
 ):
     """Shared tool-call logic for the HTTP endpoint and /demo/run.
 
@@ -241,25 +362,298 @@ def _handle_tool_call(
                 "similarity": scan.get("similarity"),
             }
         # Externalised resources execute on the protected tool backend
-        # first (only after every gateway check above has passed); a
-        # backend failure aborts before any local mutation commits.
+        # (only after every gateway check above has passed). Tier 4: a
+        # local transaction cannot span the service boundary, so external
+        # writes use a durable execution-intent state machine instead of
+        # claiming atomicity — the outcome is committed, definitively
+        # failed, or honestly "unknown" (never reported as blocked).
         tool_receipt_id = None
         if external:
-            try:
-                _svc_result, tool_receipt_id = tool_client.execute(
-                    run_id, "write", resource_id, text
+            payload_hash = make_fingerprint(text).get("hash")
+            rid = request_id or ("req-" + uuid.uuid4().hex)
+
+            def _complete_local(completion_tool_receipt_id):
+                """Local version+receipt+event+intent commit, one txn."""
+                execute_tool(
+                    conn, tool_name, operation, resource, text, commit=False
                 )
-            except RuntimeError as exc:
+                new_version_inner = store.append_artifact_version(
+                    conn, resource_id, text, run_id,
+                    content_hash=payload_hash, commit=False, force=True,
+                )
+                gateway_receipt_inner = store.insert_execution_receipt(
+                    conn, run_id, tool_name, operation, resource_id,
+                    version=(
+                        new_version_inner
+                        if new_version_inner is not None
+                        else resource.get("version")
+                    ),
+                    commit=False,
+                )
+                event_inner = store.insert_event(
+                    conn, run_id, tool_name, operation, resource_id,
+                    "allowed", "allow", scan["policy_id"], scan["reason"],
+                    similarity=scan.get("similarity"), commit=False,
+                )
+                store.update_execution_intent(
+                    conn, rid, state="committed",
+                    tool_receipt_id=completion_tool_receipt_id,
+                    gateway_receipt_id=gateway_receipt_inner,
+                    event_id=event_inner, commit=False,
+                )
+                conn.commit()
+                return gateway_receipt_inner, event_inner, new_version_inner
+
+            existing_intent = store.get_execution_intent(conn, rid)
+            if existing_intent is not None:
+                binding_mismatch = (
+                    existing_intent.get("run_id") != run_id
+                    or existing_intent.get("resource_id") != resource_id
+                    or existing_intent.get("payload_hash") != payload_hash
+                    or (
+                        existing_intent.get("tool") is not None
+                        and existing_intent.get("tool") != tool_name
+                    )
+                    or (
+                        existing_intent.get("operation") is not None
+                        and existing_intent.get("operation") != operation
+                    )
+                )
+                if binding_mismatch:
+                    reuse_reason = (
+                        "request_id was already used with a different run, "
+                        "resource, or payload"
+                    )
+                    event_id = store.insert_event(
+                        conn, run_id, tool_name, operation, resource_id,
+                        "blocked", "deny", "request-id-reuse", reuse_reason,
+                    )
+                    return 409, {
+                        "decision": "blocked",
+                        "reason": reuse_reason,
+                        "policy_id": "request-id-reuse",
+                        "request_id": rid,
+                        "event_id": event_id,
+                    }
+                if existing_intent.get("state") == "committed":
+                    return 200, {
+                        "decision": "allowed",
+                        "reason": "Idempotent replay of committed execution",
+                        "policy_id": (
+                            existing_intent.get("policy_id")
+                            or scan["policy_id"]
+                        ),
+                        "event_id": existing_intent.get("event_id"),
+                        "execution_receipt_id": existing_intent.get(
+                            "gateway_receipt_id"
+                        ),
+                        "tool_receipt_id": existing_intent.get(
+                            "tool_receipt_id"
+                        ),
+                        "request_id": rid,
+                        "replayed": True,
+                        "result": None,
+                    }
+                # unknown / dispatched / authorized_intent / failed (or any
+                # other non-committed state): reconcile before retrying.
+                receipt_info, lookup_ok = _backend_receipt_for_request(
+                    tool_client, rid
+                )
+                if not lookup_ok:
+                    try:
+                        store.update_execution_intent(
+                            conn, rid, state="unknown",
+                            error="Backend receipt lookup unavailable",
+                        )
+                    except Exception:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                    return 503, {
+                        "decision": "unknown",
+                        "reason": (
+                            "Execution outcome unknown: the backend receipt "
+                            "lookup is unavailable; retry with the same "
+                            "request_id to reconcile"
+                        ),
+                        "policy_id": "execution-outcome-unknown",
+                        "request_id": rid,
+                        "tool_receipt_id": existing_intent.get(
+                            "tool_receipt_id"
+                        ),
+                        "event_id": None,
+                    }
+                if receipt_info is not None:
+                    reconciled_tool_receipt_id = (
+                        receipt_info.get("tool_receipt_id")
+                        if isinstance(receipt_info, dict)
+                        else receipt_info
+                    )
+                    try:
+                        receipt_id, event_id, new_version = _complete_local(
+                            reconciled_tool_receipt_id
+                        )
+                    except Exception as exc:
+                        conn.rollback()
+                        try:
+                            store.update_execution_intent(
+                                conn, rid, state="unknown",
+                                tool_receipt_id=reconciled_tool_receipt_id,
+                                error=str(exc),
+                            )
+                        except Exception:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                        return 500, {
+                            "decision": "unknown",
+                            "reason": (
+                                "Backend execution committed but gateway "
+                                "audit failed; retry with the same "
+                                "request_id to reconcile"
+                            ),
+                            "policy_id": "execution-outcome-unknown",
+                            "request_id": rid,
+                            "tool_receipt_id": reconciled_tool_receipt_id,
+                            "event_id": None,
+                        }
+                    return 200, {
+                        "decision": "allowed",
+                        "reason": scan["reason"],
+                        "policy_id": (
+                            existing_intent.get("policy_id")
+                            or scan["policy_id"]
+                        ),
+                        "event_id": event_id,
+                        "execution_receipt_id": receipt_id,
+                        "tool_receipt_id": reconciled_tool_receipt_id,
+                        "request_id": rid,
+                        "reconciled": True,
+                        "version": (
+                            new_version
+                            if new_version is not None
+                            else resource.get("version")
+                        ),
+                        "result": None,
+                    }
+                # No backend receipt and the lookup succeeded: the write
+                # never executed there, so (re)dispatch under the same rid.
+                store.update_execution_intent(
+                    conn, rid, state="authorized_intent"
+                )
+            else:
+                store.create_execution_intent(
+                    conn, rid, run_id, tool_name, operation, resource_id,
+                    payload_hash, policy_id=scan["policy_id"],
+                )
+
+            dispatch_kind, _svc_result, dispatched_tool_receipt_id, dispatch_exc = (
+                _dispatch_external(
+                    tool_client, run_id, resource_id, text, rid, payload_hash
+                )
+            )
+            if dispatch_kind == "definitive":
+                store.update_execution_intent(
+                    conn, rid, state="failed", error=str(dispatch_exc)
+                )
                 event_id = store.insert_event(
                     conn, run_id, tool_name, operation, resource_id,
-                    "blocked", "deny", "tool-backend-unavailable", str(exc),
+                    "blocked", "deny", "tool-backend-unavailable",
+                    str(dispatch_exc),
                 )
                 return 503, {
                     "decision": "blocked",
-                    "reason": str(exc),
+                    "reason": str(dispatch_exc),
                     "policy_id": "tool-backend-unavailable",
                     "event_id": event_id,
+                    "request_id": rid,
                 }
+            if dispatch_kind == "ambiguous":
+                try:
+                    store.update_execution_intent(
+                        conn, rid, state="unknown", error=str(dispatch_exc)
+                    )
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                unknown_reason = (
+                    "Execution outcome unknown: the tool backend may have "
+                    "committed the write; retry with the same request_id "
+                    "to reconcile"
+                )
+                unknown_event_id = None
+                try:
+                    unknown_event_id = store.insert_event(
+                        conn, run_id, tool_name, operation, resource_id,
+                        "unknown", "unknown", "execution-outcome-unknown",
+                        unknown_reason,
+                    )
+                except Exception:
+                    unknown_event_id = None
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                return 503, {
+                    "decision": "unknown",
+                    "reason": unknown_reason,
+                    "policy_id": "execution-outcome-unknown",
+                    "request_id": rid,
+                    "event_id": unknown_event_id,
+                }
+            # Dispatch succeeded: mark dispatched durably, then complete
+            # the local transaction (extended with the intent commit).
+            tool_receipt_id = dispatched_tool_receipt_id
+            store.update_execution_intent(
+                conn, rid, state="dispatched",
+                tool_receipt_id=tool_receipt_id,
+            )
+            try:
+                receipt_id, event_id, new_version = _complete_local(
+                    tool_receipt_id
+                )
+            except Exception as exc:
+                conn.rollback()
+                try:
+                    store.update_execution_intent(
+                        conn, rid, state="unknown",
+                        tool_receipt_id=tool_receipt_id, error=str(exc),
+                    )
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                return 500, {
+                    "decision": "unknown",
+                    "reason": (
+                        "Backend execution committed but gateway audit "
+                        "failed; retry with the same request_id to reconcile"
+                    ),
+                    "policy_id": "execution-outcome-unknown",
+                    "request_id": rid,
+                    "tool_receipt_id": tool_receipt_id,
+                    "event_id": None,
+                }
+            return 200, {
+                "decision": "allowed",
+                "reason": scan["reason"],
+                "policy_id": scan["policy_id"],
+                "event_id": event_id,
+                "execution_receipt_id": receipt_id,
+                "tool_receipt_id": tool_receipt_id,
+                "request_id": rid,
+                "version": (
+                    new_version
+                    if new_version is not None
+                    else resource.get("version")
+                ),
+                "result": None,
+            }
         # Execute + version + receipt + audit event commit atomically:
         # a failure anywhere rolls the resource mutation back, so a
         # write can never succeed silently without its event.
@@ -735,6 +1129,22 @@ def create_app(
             )
             return {"count": len(receipts), "receipts": receipts}
 
+    @application.get("/execution-intents")
+    def list_execution_intents_endpoint(
+        run_id: Optional[str] = None,
+        resource_id: Optional[str] = None,
+        limit: int = 200,
+        authorization: Optional[str] = Header(None),
+        x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
+    ):
+        with state.lock:
+            if not _is_admin(authorization, x_admin_key):
+                return _admin_denied()
+            intents = store.list_execution_intents(
+                state.conn, run_id=run_id, resource_id=resource_id, limit=limit
+            )
+            return {"count": len(intents), "intents": intents}
+
     @application.post("/tools/{tool_name}")
     def call_tool(
         tool_name: str,
@@ -763,6 +1173,7 @@ def create_app(
                 body.content,
                 tool_client=state.tool_client,
                 external_resources=state.external_resources,
+                request_id=body.request_id,
             )
             if status == 200:
                 return payload

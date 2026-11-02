@@ -181,6 +181,22 @@ def init_db(db_path) -> sqlite3.Connection:
           shingles TEXT,
           created_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS execution_intents(
+          request_id TEXT PRIMARY KEY,
+          ts TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          run_id TEXT,
+          tool TEXT,
+          operation TEXT,
+          resource_id TEXT,
+          payload_hash TEXT,
+          policy_id TEXT,
+          state TEXT NOT NULL,
+          tool_receipt_id INTEGER,
+          gateway_receipt_id INTEGER,
+          event_id INTEGER,
+          error TEXT
+        );
         """
     )
     conn.commit()
@@ -219,6 +235,16 @@ def init_db(db_path) -> sqlite3.Connection:
     if "tenant" not in resource_cols:
         conn.execute("ALTER TABLE resources ADD COLUMN tenant TEXT NOT NULL DEFAULT ''")
     conn.execute("UPDATE resources SET tenant = project WHERE tenant = ''")
+    # Migrate execution_intents tables created before the policy_id column.
+    try:
+        intent_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(execution_intents)").fetchall()
+        }
+    except Exception:
+        intent_cols = set()
+    if intent_cols and "policy_id" not in intent_cols:
+        conn.execute("ALTER TABLE execution_intents ADD COLUMN policy_id TEXT")
     conn.commit()
     return conn
 
@@ -514,11 +540,18 @@ def create_artifact(
 
 
 def append_artifact_version(
-    conn, resource_id, content, created_by, content_hash=None, commit=True
+    conn, resource_id, content, created_by, content_hash=None, commit=True,
+    force=False,
 ) -> Optional[int]:
-    """Append a version for an artifact write; None if not an artifact."""
+    """Append a version for an artifact write; None if not an artifact.
+
+    ``force=True`` also versions a seeded (non-artifact) resource; the
+    gateway uses it for externalised writes, whose Tier 4 local
+    completion transaction includes a version row even though the
+    resource was not created via ``POST /artifacts``.
+    """
     resource = get_resource(conn, resource_id)
-    if resource is None or resource.get("created_by") is None:
+    if resource is None or (resource.get("created_by") is None and not force):
         return None
     new_version = int(resource.get("version") or 1) + 1
     conn.execute(
@@ -578,8 +611,87 @@ def list_execution_receipts(conn, run_id=None, resource_id=None) -> list:
     return [dict(r) for r in conn.execute(query, params).fetchall()]
 
 
+def create_execution_intent(
+    conn, request_id, run_id, tool, operation, resource_id, payload_hash,
+    policy_id=None,
+) -> dict:
+    """Create a durable ``authorized_intent`` row and commit immediately.
+
+    The intent must be durable before any external dispatch, so this
+    function always commits (no ``commit=False`` mode).
+    """
+    now = _now()
+    conn.execute(
+        "INSERT INTO execution_intents(request_id, ts, updated_at, run_id, tool,"
+        " operation, resource_id, payload_hash, policy_id, state)"
+        " VALUES (?,?,?,?,?,?,?,?,?,'authorized_intent')",
+        (request_id, now, now, run_id, tool, operation, resource_id,
+         payload_hash, policy_id),
+    )
+    conn.commit()
+    return get_execution_intent(conn, request_id)
+
+
+def get_execution_intent(conn, request_id) -> Optional[dict]:
+    if request_id is None:
+        return None
+    row = conn.execute(
+        "SELECT * FROM execution_intents WHERE request_id = ?", (request_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
+def update_execution_intent(
+    conn, request_id, state=None, tool_receipt_id=None, gateway_receipt_id=None,
+    event_id=None, error=None, commit=True, policy_id=None,
+) -> Optional[dict]:
+    """Update only the non-None fields (plus ``updated_at``) of an intent."""
+    assignments = ["updated_at = ?"]
+    params = [_now()]
+    for column, value in (
+        ("state", state),
+        ("tool_receipt_id", tool_receipt_id),
+        ("gateway_receipt_id", gateway_receipt_id),
+        ("event_id", event_id),
+        ("error", error),
+        ("policy_id", policy_id),
+    ):
+        if value is not None:
+            assignments.append("{} = ?".format(column))
+            params.append(value)
+    params.append(request_id)
+    conn.execute(
+        "UPDATE execution_intents SET {} WHERE request_id = ?".format(
+            ", ".join(assignments)
+        ),
+        params,
+    )
+    if commit:
+        conn.commit()
+    return get_execution_intent(conn, request_id)
+
+
+def list_execution_intents(conn, run_id=None, resource_id=None, limit=200) -> list:
+    query = "SELECT * FROM execution_intents"
+    clauses, params = [], []
+    if run_id is not None:
+        clauses.append("run_id = ?")
+        params.append(run_id)
+    if resource_id is not None:
+        clauses.append("resource_id = ?")
+        params.append(resource_id)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY ts, request_id LIMIT ?"
+    params.append(limit)
+    return [dict(r) for r in conn.execute(query, params).fetchall()]
+
+
 def reset_all(conn) -> None:
     conn.execute("DELETE FROM runs")
+    conn.execute("DELETE FROM execution_intents")
     conn.execute("DELETE FROM events")
     conn.execute("DELETE FROM fingerprints")
     conn.execute("DELETE FROM artifact_versions")

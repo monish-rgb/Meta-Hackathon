@@ -17,6 +17,9 @@ class ToolCallRequest(BaseModel):
     operation: Literal["read", "write"]
     resource_id: str
     content: Optional[str] = None
+    request_id: Optional[str] = Field(
+        default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    )
 
 
 class ChallengeRequest(BaseModel):

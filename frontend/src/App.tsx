@@ -5,13 +5,22 @@ import {
   getGraph,
   listAlerts,
   listEvents,
+  listExecutionIntents,
   listResources,
   listRuns,
   resetDemo,
   runDemo,
   setAdminKey,
 } from './api';
-import type { AlertItem, DemoResult, EventItem, Graph, Resource, Run } from './api';
+import type {
+  AlertItem,
+  DemoResult,
+  EventItem,
+  ExecutionIntent,
+  Graph,
+  Resource,
+  Run,
+} from './api';
 import EventFeed from './components/EventFeed';
 import EvidenceWall from './components/EvidenceWall';
 import ChallengePanel from './components/ChallengePanel';
@@ -23,6 +32,7 @@ export default function App() {
   const [runs, setRuns] = useState<Run[]>([]);
   const [events, setEvents] = useState<EventItem[]>([]);
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
+  const [intents, setIntents] = useState<ExecutionIntent[]>([]);
   const [graph, setGraph] = useState<Graph>({ nodes: [], edges: [] });
   const [resources, setResources] = useState<Resource[]>([]);
   const [demo, setDemo] = useState<DemoResult | null>(null);
@@ -34,18 +44,20 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [r, e, g, res, al] = await Promise.all([
+      const [r, e, g, res, al, ex] = await Promise.all([
         listRuns(),
         listEvents({ limit: 200 }),
         getGraph(),
         listResources(),
         listAlerts(50),
+        listExecutionIntents(),
       ]);
       setRuns(r);
       setEvents(e);
       setGraph(g);
       setResources(res);
       setAlerts(al.alerts);
+      setIntents(ex);
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -214,6 +226,53 @@ export default function App() {
             <p className="muted">No blocked attempts recorded.</p>
           ) : (
             <EventFeed events={alerts} />
+          )}
+        </section>
+        <section className="panel wide">
+          <h2>Execution intents</h2>
+          {intents.length === 0 ? (
+            <p className="muted">No execution intents yet.</p>
+          ) : (
+            <div className="intents">
+              {intents.map((intent) => {
+                const isUnknown = intent.state === 'unknown';
+                return (
+                  <div
+                    key={intent.request_id}
+                    className={`intent${isUnknown ? ' unknown' : ''}`}
+                  >
+                    <div className="intent-head">
+                      <code title={intent.request_id}>
+                        {intent.request_id.slice(0, 8)}…
+                      </code>
+                      <span>
+                        resource: <code>{intent.resource_id ?? '—'}</code>
+                      </span>
+                      <span
+                        className={`badge intent-state${isUnknown ? ' unknown' : ''}`}
+                      >
+                        {isUnknown ? 'UNKNOWN' : intent.state}
+                      </span>
+                      {isUnknown && (
+                        <span className="unknown-note">
+                          Needs reconciliation before retry
+                        </span>
+                      )}
+                      <span>
+                        tool receipt:{' '}
+                        {intent.tool_receipt_id !== null &&
+                        intent.tool_receipt_id !== undefined
+                          ? String(intent.tool_receipt_id)
+                          : '—'}
+                      </span>
+                    </div>
+                    {intent.error && (
+                      <div className="intent-error">{intent.error}</div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           )}
         </section>
         <section className="panel wide">

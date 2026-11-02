@@ -157,6 +157,32 @@ export interface AlertItem extends EventItem {
 export const listAlerts = (limit = 50) =>
   req<{ count: number; alerts: AlertItem[] }>(`/alerts?limit=${limit}`);
 
+export interface ExecutionIntent {
+  request_id: string;
+  ts: string;
+  updated_at: string;
+  run_id: string | null;
+  tool: string | null;
+  operation: string | null;
+  resource_id: string | null;
+  payload_hash: string | null;
+  state: string;
+  tool_receipt_id: number | string | null;
+  gateway_receipt_id: number | null;
+  event_id: number | null;
+  policy_id: string | null;
+  error: string | null;
+}
+
+export async function listExecutionIntents(): Promise<ExecutionIntent[]> {
+  const data = await req<
+    | ExecutionIntent[]
+    | { intents?: ExecutionIntent[]; execution_intents?: ExecutionIntent[] }
+  >('/execution-intents');
+  if (Array.isArray(data)) return data;
+  return data.intents ?? data.execution_intents ?? [];
+}
+
 export interface ToolReceipt {
   receipt_id?: number;
   ts?: string;

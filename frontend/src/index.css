@@ -181,6 +181,63 @@ button.secondary:hover:not(:disabled) {
   color: #7dffa8;
 }
 
+.event.unknown {
+  border-left-color: #d29922;
+  border-color: #d29922;
+  background: #2d2108;
+}
+
+.event.unknown .badge {
+  background: #d29922;
+  color: #1c1600;
+}
+
+.unknown-note {
+  color: #f0b429;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.intents {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.intent {
+  border: 1px solid #30363d;
+  border-left-width: 4px;
+  border-radius: 6px;
+  padding: 8px 12px;
+  background: #0d1117;
+}
+
+.intent.unknown {
+  border-color: #d29922;
+  border-left-color: #d29922;
+  background: #2d2108;
+  box-shadow: 0 0 0 1px #d29922;
+}
+
+.intent-head {
+  display: flex;
+  gap: 8px 14px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: 0.9rem;
+}
+
+.badge.intent-state.unknown {
+  background: #d29922;
+  color: #1c1600;
+}
+
+.intent-error {
+  margin-top: 4px;
+  font-size: 0.85rem;
+  color: #f0b429;
+}
+
 .event-head {
   display: flex;
   gap: 8px;

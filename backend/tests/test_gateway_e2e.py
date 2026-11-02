@@ -711,17 +711,42 @@ class _ToolClientAdapter:
                             service_key=self.KEY)
         )
 
-    def execute(self, run_id, operation, resource_id, content=None):
+    def execute(self, run_id, operation, resource_id, content=None,
+                request_id=None, payload_hash=None):
+        payload = {"resource_id": resource_id, "operation": operation,
+                   "content": content, "run_id": run_id}
+        if request_id is not None:
+            payload["request_id"] = request_id
+        if payload_hash is not None:
+            payload["payload_hash"] = payload_hash
         resp = self.http.post(
             "/execute",
-            json={"resource_id": resource_id, "operation": operation,
-                  "content": content, "run_id": run_id},
+            json=payload,
             headers={"X-Tool-Key": self.KEY},
         )
+        if resp.status_code == 409:
+            raise RuntimeError(
+                f"request-id-reuse: tool backend 409: {resp.text}"
+            )
         if resp.status_code != 200:
             raise RuntimeError(f"tool backend {resp.status_code}: {resp.text}")
         body = resp.json()
         return body.get("result"), body.get("receipt_id")
+
+    def receipt_for_request(self, request_id):
+        resp = self.http.get(
+            "/receipts", params={"request_id": request_id},
+            headers={"X-Tool-Key": self.KEY},
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"tool backend receipts {resp.status_code}: {resp.text}"
+            )
+        body = resp.json()
+        receipts = body.get("receipts") if isinstance(body, dict) else body
+        if not receipts:
+            return None
+        return receipts[0]
 
     def state(self, resource_id):
         resp = self.http.get(
