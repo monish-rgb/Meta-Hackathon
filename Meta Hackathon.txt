@@ -1,0 +1,36 @@
+security infrastructure for LLM-based systems remains underdeveloped
+
+Large language models (LLMs) have evolved from simple chatbots into autonomous agents capable of performing complex tasks such as editing production code, orchestrating workflows, and taking higher-stakes
+actions based on untrusted inputs like webpages and emails. These capabilities introduce new security risks
+that existing security measures, such as model fine-tuning or chatbot-focused guardrails, do not fully address.
+Given the higher stakes and the absence of deterministic solutions to mitigate these risks, there is a critical
+need for a real-time guardrail monitor to serve as a final layer of defense, and support system level, use case
+specific safety policy definition and enforcement. 
+
+LlamaFirewall is an open-source, system-level security framework for LLMpowered applications, built with a modular design to support layered, adaptive defense. We include three guardrails
+tailored to the needs of LLM agent workflows. These fall into two categories: prompt injection/agent misalignment and
+insecure/dangerous code.
+
+
+
+https://github.com/meta-llama/PurpleLlama/tree/main/LlamaFirewall
+
+https://ai.meta.com/blog/ai-defenders-program-llama-protection-tools/
+
+(https://www.perplexity.ai/search/e515ceb9-ddbe-4e80-a830-43beccdcf3b5)
+
+problem statement could be:
+Separately sandboxed AI agents can still exchange information through shared tools and services outside their intended permissions. Developers need a way to enforce sharing boundaries across runs and investigate activity that is difficult to understand from individual agent traces alone.
+
+Solution statement :
+An externally enforced gateway that controls each AI agent run’s access to protected shared tools and services and connects activity across runs to identify signs of unauthorized sharing. It blocks policy-violating requests before execution, can suspend further access for affected runs, and alerts developers with a clear record of what was attempted, allowed, and blocked.
+
+
+A -- private network A --+
+B -- private network B --+--> MCP gateway --> mock cache
+C -- private network C --+       |        --> artifact service
+D -- private network D --+       |        --> local challenge fixtures
+                                |
+                          trusted event database
+                                |
+                          human incident viewer

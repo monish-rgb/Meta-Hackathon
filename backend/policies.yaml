@@ -1,0 +1,14 @@
+default_action: deny
+rules:
+  - id: deny-cross-project
+    action: deny
+    reason: "Cross-project access is not allowed"
+    when: { project_relation: different }
+  - id: deny-insufficient-clearance
+    action: deny
+    reason: "Run clearance is below resource sensitivity"
+    when: { clearance_vs_sensitivity: lt }
+  - id: allow-label-match
+    action: allow
+    reason: "Labels allow this access"
+    when: {}

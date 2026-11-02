@@ -1,0 +1,16 @@
+Tech stack I'd build it with
+optimized for hackathon speed + credibility:
+
+Layer	Choice	Why
+Gateway	Python 3.12 + FastAPI + official MCP Python SDK	Agent ecosystem is Python-first; easy text-similarity/hashing; expose tools as MCP so any agent framework can plug in
+Policy engine	YAML policies + small custom evaluator (~100 lines)	Skip OPA/Rego for MVP — too much learning curve. Deny-overrides-allow, label-based rules
+Data	PostgreSQL (audit log, lineage) + Redis (run suspension, token revocation)	Postgres via Docker Compose; Redis makes the kill-switch instant and checkable per-request
+Detection	Deterministic first: SHA hashes, canary tokens, normalized n-gram overlap (Jaccard)	Fast, explainable, no API cost. Embeddings/pgvector only as phase 2
+Identity	Short-lived JWT per run (run_id, project, clearance, expiry)	Gateway validates on every call; suspension = revoke + flag
+Frontend	Next.js + TypeScript + Tailwind + React Flow	React Flow gives you the cross-run lineage graph almost for free — this is your money visual
+Alerts	Dashboard + Slack/webhook POST	One webhook integration is enough
+Infra	Docker Compose, single repo	No Kubernetes, no Kafka, no microservices. It's a gateway + API + UI
+If your team is stronger in TypeScript, flip the backend to Node/Fastify — the stack matters less than shipping the detection loop.
+
+What a good MVP looks like
+Core concept — labels: Every run gets labels (project: alpha, clearance: secret). Every resource gets labels (project: alpha, sensitivity: secret). Rule of thumb (Bell-LaPadula, simplified): a run can't read above its clearance, and can't write data down to a lower/other-project resource. That one idea powers most of your blocking.
