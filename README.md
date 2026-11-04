@@ -1,6 +1,6 @@
 # FlowGate - Agent Information-Flow Gateway
 
-> *Sandboxes isolate execution. We isolate information.*
+> *Sandboxes isolate execution. FlowGate isolates information.*
 
 Sandboxed AI agent runs still leak information to each other through shared tools - documents, caches, databases, MCP servers. A run can copy or summarise sensitive data into a shared resource, and another run that was never granted access can read it back. Each individual trace looks innocent; only the cross-run view shows the leak.
 
