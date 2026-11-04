@@ -64,10 +64,10 @@ Also runnable headless: start the backend, then `python scripts/demo.py --admin-
 
 ## Real-workflow integration (Tier 5)
 
-- **Client library** — `flowgate_client/` is an importable httpx client (`create_run`, tool calls, artifacts, receipts/intents); `scripts/agent_demo.py` runs one real-LLM step through it (the model proposes, the gateway disposes; restricted content never enters model context).
-- **File-docs connector** — `backend/file_docs_service.py` serves real document files behind the same gateway-held key + request-id dedupe protocol, so tenant documents live outside the gateway store.
-- **Clean-context spawning** — a controller can spawn a `clean` run (fresh label, recorded lineage, for innocent public output) or a `continuing` run (server-side inherits the parent's current label — a fresh token never launders provenance). Suspension means exactly that a run's gateway access is revoked.
-- **Flagship demo** — `python scripts/tenant_assistant_demo.py` boots both services and runs the multi-tenant story end-to-end: private brief → inherited-label draft → blocked publish → cross-tenant block → clean spawn publishes, continuing spawn blocked.
+- **Client library** - `flowgate_client/` is an importable httpx client (`create_run`, tool calls, artifacts, receipts/intents); `scripts/agent_demo.py` runs one real-LLM step through it (the model proposes, the gateway disposes; restricted content never enters model context).
+- **File-docs connector** - `backend/file_docs_service.py` serves real document files behind the same gateway-held key + request-id dedupe protocol, so tenant documents live outside the gateway store.
+- **Clean-context spawning** - a controller can spawn a `clean` run (fresh label, recorded lineage, for innocent public output) or a `continuing` run (server-side inherits the parent's current label - a fresh token never launders provenance). Suspension means exactly that a run's gateway access is revoked.
+- **Flagship demo** - `python scripts/tenant_assistant_demo.py` boots both services and runs the multi-tenant story end-to-end: private brief → inherited-label draft → blocked publish → cross-tenant block → clean spawn publishes, continuing spawn blocked.
 
 ## Tests
 
@@ -86,7 +86,3 @@ npm run build
 - [frontend/src/](frontend/src/) — dashboard: live event feed, React Flow lineage graph, runs panel, attack simulator
 - [scripts/demo.py](scripts/demo.py) — external demo client
 - [.claude/agents/](.claude/agents/) — project subagents used to build this (backend, detection, tools/seed, frontend, demo/tests, integration, adversarial verifier). They activate as named agent types after a Claude Code restart; this build ran the same roles via parallel general-purpose agents.
-
-## Scope (honest limits)
-
-FlowGate protects tools routed through the gateway. Its principal guarantee is the label flow rule for reads tracked through the gateway; the fingerprint scanner is a backstop that catches verbatim, near-verbatim, canary-bearing, and fragmented-but-overlapping copies (including writes by runs that never read the source here, thanks to seeded fingerprints). A paraphrase with near-zero shingle overlap by a writer who never read through the gateway, and channels outside the gateway, remain out of scope for this MVP. Detection is deliberately deterministic and explainable: every block names the policy or fingerprint that caused it (canary values are never written into event reasons).
